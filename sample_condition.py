@@ -2,7 +2,7 @@ from functools import partial
 import os
 import argparse
 import yaml
-
+import json
 import torch
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
@@ -15,12 +15,26 @@ from data.dataloader import get_dataset, get_dataloader
 from util.img_utils import clear_color, mask_generator
 from util.logger import get_logger
 
+# Compute metric
+from pathlib import Path
+from skimage.metrics import peak_signal_noise_ratio
+from tqdm import tqdm
+from os import listdir
+
+import lpips
+from monai.metrics import PSNRMetric
+import numpy as np
+
+import PIL
+import torchvision.transforms.functional as transform
+import torchvision.utils as tvu
+import torchvision.transforms as transforms
+
 
 def load_yaml(file_path: str) -> dict:
     with open(file_path) as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
     return config
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -38,6 +52,13 @@ def main():
     device_str = f"cuda:{args.gpu}" if torch.cuda.is_available() else 'cpu'
     logger.info(f"Device set to {device_str}.")
     device = torch.device(device_str)  
+
+    inv_transform = transforms.Compose([
+        transforms.Normalize((-1), (2)),
+        transforms.Lambda(lambda x: x.clamp(0, 1).detach())
+    ])
+    psnr_metric = PSNRMetric(max_val=1)    
+    lpips_metric = lpips.LPIPS(net='vgg').to(device).eval()
     
     # Load configurations
     model_config = load_yaml(args.model_config)
@@ -71,8 +92,8 @@ def main():
     # Working directory
     out_path = os.path.join(args.save_dir, measure_config['operator']['name'])
     os.makedirs(out_path, exist_ok=True)
-    for img_dir in ['input', 'recon', 'progress', 'label']:
-        os.makedirs(os.path.join(out_path, img_dir), exist_ok=True)
+    #for img_dir in ['input', 'recon', 'progress', 'label']:
+    #    os.makedirs(os.path.join(out_path, img_dir), exist_ok=True)
 
     # Prepare dataloader
     data_config = task_config['data']
@@ -88,6 +109,10 @@ def main():
         )
         
     # Do Inference
+    count = 0
+    PSNR_mov_sum = 0.0
+    LPIPS_mov_sum = 0.0
+
     for i, ref_img in enumerate(loader):
         logger.info(f"Inference for image {i}")
         fname = str(i).zfill(5) + '.png'
@@ -113,9 +138,23 @@ def main():
         x_start = torch.randn(ref_img.shape, device=device).requires_grad_()
         sample = sample_fn(x_start=x_start, measurement=y_n, record=True, save_root=out_path)
 
-        plt.imsave(os.path.join(out_path, 'input', fname), clear_color(y_n))
-        plt.imsave(os.path.join(out_path, 'label', fname), clear_color(ref_img))
-        plt.imsave(os.path.join(out_path, 'recon', fname), clear_color(sample))
+        count += 1
+        PSNR_mov_sum += psnr_metric(inv_transform(ref_img), inv_transform(sample)).item()
+        LPIPS_mov_sum += lpips_metric(inv_transform(ref_img), inv_transform(sample)).item()
+
+        PSNR_mov_avg = PSNR_mov_sum / count
+        LPIPS_mov_avg = LPIPS_mov_sum / count
+        print(f"PSNR moving average: {PSNR_mov_avg}")
+        print(f"LPIPS moving average: {LPIPS_mov_avg}")
+
+
+    averages = {}
+    averages["psnr_avg"] = PSNR_mov_avg
+    averages["lpips_avg"] = LPIPS_mov_avg
+        
+    save_path = os.path.join(out_path, "metrics_avg.json")
+    with open(save_path, "w") as f:
+        json.dump(averages, f, indent=4)
 
 if __name__ == '__main__':
     main()
